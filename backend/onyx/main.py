@@ -1,3 +1,4 @@
+import os
 import sys
 import traceback
 from collections.abc import AsyncGenerator
@@ -378,6 +379,55 @@ def get_application() -> FastAPI:
         include_auth_router_with_prefix(
             application,
             fastapi_users.get_logout_router(auth_backend),
+            prefix="/auth",
+        )
+    
+    if AUTH_TYPE == AuthType.OIDC:
+        # Import OpenID client
+        from httpx_oauth.clients.openid import OpenID, BASE_SCOPES
+        
+        # Get OIDC configuration URL from environment
+        openid_config_url = os.environ.get("OPENID_CONFIG_URL", "")
+        if not openid_config_url:
+            logger.error("OPENID_CONFIG_URL environment variable is not set")
+            raise ValueError("OPENID_CONFIG_URL environment variable is required for OIDC authentication")
+            
+        # Get optional scope override from environment
+        oidc_scope_override = None
+        _oidc_scope_override = os.environ.get("OIDC_SCOPE_OVERRIDE")
+        if _oidc_scope_override:
+            try:
+                oidc_scope_override = [
+                    scope.strip() for scope in _oidc_scope_override.split(",")
+                ]
+                logger.info(f"Using custom OIDC scopes: {oidc_scope_override}")
+            except Exception as e:
+                logger.error(f"Failed to parse OIDC_SCOPE_OVERRIDE: {e}")
+                
+        # Set up OIDC authentication
+        include_auth_router_with_prefix(
+            application,
+            create_onyx_oauth_router(
+                OpenID(
+                    OAUTH_CLIENT_ID,
+                    OAUTH_CLIENT_SECRET,
+                    openid_config_url,
+                    # BASE_SCOPES is the same as not setting this
+                    base_scopes=oidc_scope_override or BASE_SCOPES,
+                ),
+                auth_backend,
+                USER_AUTH_SECRET,
+                associate_by_email=True,
+                is_verified_by_default=True,
+                redirect_url=f"{WEB_DOMAIN}/auth/oidc/callback",
+            ),
+            prefix="/auth/oidc",
+        )
+
+        # Need basic auth router for `logout` endpoint
+        include_auth_router_with_prefix(
+            application,
+            fastapi_users.get_auth_router(auth_backend),
             prefix="/auth",
         )
 
