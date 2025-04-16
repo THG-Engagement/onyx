@@ -1,4 +1,3 @@
-import io
 import json
 import time
 from collections.abc import Callable
@@ -19,17 +18,11 @@ from requests import HTTPError
 
 from ee.onyx.configs.app_configs import OAUTH_CONFLUENCE_CLOUD_CLIENT_ID
 from ee.onyx.configs.app_configs import OAUTH_CONFLUENCE_CLOUD_CLIENT_SECRET
-from onyx.configs.app_configs import (
-    CONFLUENCE_CONNECTOR_ATTACHMENT_CHAR_COUNT_THRESHOLD,
-)
-from onyx.configs.app_configs import CONFLUENCE_CONNECTOR_ATTACHMENT_SIZE_THRESHOLD
 from onyx.connectors.confluence.utils import _handle_http_error
 from onyx.connectors.confluence.utils import confluence_refresh_tokens
 from onyx.connectors.confluence.utils import get_start_param_from_url
 from onyx.connectors.confluence.utils import update_param_in_path
-from onyx.connectors.confluence.utils import validate_attachment_filetype
 from onyx.connectors.interfaces import CredentialsProviderInterface
-from onyx.file_processing.extract_file_text import extract_file_text
 from onyx.file_processing.html_utils import format_document_soup
 from onyx.redis.redis_pool import get_redis_client
 from onyx.utils.logger import setup_logger
@@ -79,12 +72,14 @@ class OnyxConfluence:
 
     CREDENTIAL_PREFIX = "connector:confluence:credential"
     CREDENTIAL_TTL = 300  # 5 min
+    PROBE_TIMEOUT = 5  # 5 seconds
 
     def __init__(
         self,
         is_cloud: bool,
         url: str,
         credentials_provider: CredentialsProviderInterface,
+        timeout: int | None = None,
     ) -> None:
         self._is_cloud = is_cloud
         self._url = url.rstrip("/")
@@ -107,11 +102,13 @@ class OnyxConfluence:
 
         self._kwargs: Any = None
 
-        self.shared_base_kwargs = {
+        self.shared_base_kwargs: dict[str, str | int | bool] = {
             "api_version": "cloud" if is_cloud else "latest",
             "backoff_and_retry": True,
             "cloud": is_cloud,
         }
+        if timeout:
+            self.shared_base_kwargs["timeout"] = timeout
 
     def _renew_credentials(self) -> tuple[dict[str, Any], bool]:
         """credential_json - the current json credentials
@@ -198,6 +195,8 @@ class OnyxConfluence:
         **kwargs: Any,
     ) -> None:
         merged_kwargs = {**self.shared_base_kwargs, **kwargs}
+        # add special timeout to make sure that we don't hang indefinitely
+        merged_kwargs["timeout"] = self.PROBE_TIMEOUT
 
         with self._credentials_provider:
             credentials, _ = self._renew_credentials()
@@ -404,9 +403,9 @@ class OnyxConfluence:
             return attr
 
         # wrap the method with our retry handler
-        rate_limited_method: Callable[
-            ..., Any
-        ] = self._make_rate_limited_confluence_method(name, self._credentials_provider)
+        rate_limited_method: Callable[..., Any] = (
+            self._make_rate_limited_confluence_method(name, self._credentials_provider)
+        )
 
         def wrapped_method(*args: Any, **kwargs: Any) -> Any:
             return rate_limited_method(*args, **kwargs)
@@ -495,6 +494,16 @@ class OnyxConfluence:
             old_url_suffix = url_suffix
             url_suffix = cast(str, next_response.get("_links", {}).get("next", ""))
 
+            # we've observed that Confluence sometimes returns a next link despite giving
+            # 0 results. This is a bug with Confluence, so we need to check for it and
+            # stop paginating.
+            if url_suffix and not results:
+                logger.info(
+                    f"No results found for call '{old_url_suffix}' despite next link "
+                    "being present. Stopping pagination."
+                )
+                break
+
             # make sure we don't update the start by more than the amount
             # of results we were able to retrieve. The Confluence API has a
             # weird behavior where if you pass in a limit that is too large for
@@ -505,10 +514,12 @@ class OnyxConfluence:
                 new_start = get_start_param_from_url(url_suffix)
                 previous_start = get_start_param_from_url(old_url_suffix)
                 if new_start - previous_start > len(results):
-                    logger.warning(
+                    logger.debug(
                         f"Start was updated by more than the amount of results "
-                        f"retrieved. This is a bug with Confluence. Start: {new_start}, "
-                        f"Previous Start: {previous_start}, Len Results: {len(results)}."
+                        f"retrieved for `{url_suffix}`. This is a bug with Confluence, "
+                        "but we have logic to work around it - don't worry this isn't"
+                        f" causing an issue. Start: {new_start}, Previous Start: "
+                        f"{previous_start}, Len Results: {len(results)}."
                     )
 
                     # Update the url_suffix to use the adjusted start
@@ -806,65 +817,6 @@ def _get_user(confluence_client: OnyxConfluence, user_id: str) -> str:
         _USER_ID_TO_DISPLAY_NAME_CACHE[user_id] = found_display_name
 
     return _USER_ID_TO_DISPLAY_NAME_CACHE.get(user_id) or _USER_NOT_FOUND
-
-
-def attachment_to_content(
-    confluence_client: OnyxConfluence,
-    attachment: dict[str, Any],
-    parent_content_id: str | None = None,
-) -> str | None:
-    """If it returns None, assume that we should skip this attachment."""
-    if not validate_attachment_filetype(attachment):
-        return None
-
-    if "api.atlassian.com" in confluence_client.url:
-        # https://developer.atlassian.com/cloud/confluence/rest/v1/api-group-content---attachments/#api-wiki-rest-api-content-id-child-attachment-attachmentid-download-get
-        if not parent_content_id:
-            logger.warning(
-                "parent_content_id is required to download attachments from Confluence Cloud!"
-            )
-            return None
-
-        download_link = (
-            confluence_client.url
-            + f"/rest/api/content/{parent_content_id}/child/attachment/{attachment['id']}/download"
-        )
-    else:
-        download_link = confluence_client.url + attachment["_links"]["download"]
-
-    attachment_size = attachment["extensions"]["fileSize"]
-    if attachment_size > CONFLUENCE_CONNECTOR_ATTACHMENT_SIZE_THRESHOLD:
-        logger.warning(
-            f"Skipping {download_link} due to size. "
-            f"size={attachment_size} "
-            f"threshold={CONFLUENCE_CONNECTOR_ATTACHMENT_SIZE_THRESHOLD}"
-        )
-        return None
-
-    logger.info(f"_attachment_to_content - _session.get: link={download_link}")
-
-    # why are we using session.get here? we probably won't retry these ... is that ok?
-    response = confluence_client._session.get(download_link)
-    if response.status_code != 200:
-        logger.warning(
-            f"Failed to fetch {download_link} with invalid status code {response.status_code}"
-        )
-        return None
-
-    extracted_text = extract_file_text(
-        io.BytesIO(response.content),
-        file_name=attachment["title"],
-        break_on_unprocessable=False,
-    )
-    if len(extracted_text) > CONFLUENCE_CONNECTOR_ATTACHMENT_CHAR_COUNT_THRESHOLD:
-        logger.warning(
-            f"Skipping {download_link} due to char count. "
-            f"char count={len(extracted_text)} "
-            f"threshold={CONFLUENCE_CONNECTOR_ATTACHMENT_CHAR_COUNT_THRESHOLD}"
-        )
-        return None
-
-    return extracted_text
 
 
 def extract_text_from_confluence_html(

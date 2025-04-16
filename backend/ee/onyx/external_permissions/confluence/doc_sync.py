@@ -2,6 +2,8 @@
 Rules defined here:
 https://confluence.atlassian.com/conf85/check-who-can-view-a-page-1283360557.html
 """
+
+from collections.abc import Generator
 from typing import Any
 
 from ee.onyx.configs.app_configs import CONFLUENCE_ANONYMOUS_ACCESS_IS_PUBLIC
@@ -158,6 +160,9 @@ def _get_space_permissions(
 
         # Stores the permissions for each space
         space_permissions_by_space_key[space_key] = space_permissions
+        logger.info(
+            f"Found space permissions for space '{space_key}': {space_permissions}"
+        )
 
     return space_permissions_by_space_key
 
@@ -215,10 +220,9 @@ def _get_all_page_restrictions(
     perm_sync_data: dict[str, Any],
 ) -> ExternalAccess | None:
     """
-    This function gets the restrictions for a page by taking the intersection
-    of the page's restrictions and the restrictions of all the ancestors
-    of the page.
-    If the page/ancestor has no restrictions, then it is ignored (no intersection).
+    This function gets the restrictions for a page. In Confluence, a child can have
+    at MOST the same level accessibility as its immediate parent.
+
     If no restrictions are found anywhere, then return None, indicating that the page
     should inherit the space's restrictions.
     """
@@ -229,9 +233,22 @@ def _get_all_page_restrictions(
         confluence_client=confluence_client,
         restrictions=perm_sync_data.get("restrictions", {}),
     )
+    # if there are individual page-level restrictions, then this is the accurate
+    # restriction for the page. You cannot both have page-level restrictions AND
+    # inherit restrictions from the parent.
+    if bool(found_user_emails or found_group_names):
+        return ExternalAccess(
+            external_user_emails=found_user_emails,
+            external_user_group_ids=found_group_names,
+            is_public=False,
+        )
 
     ancestors: list[dict[str, Any]] = perm_sync_data.get("ancestors", [])
-    for ancestor in ancestors:
+    # ancestors seem to be in order from root to immediate parent
+    # https://community.atlassian.com/forums/Confluence-questions/Order-of-ancestors-in-REST-API-response-Confluence-Server-amp/qaq-p/2385981
+    # we want the restrictions from the immediate parent to take precedence, so we should
+    # reverse the list
+    for ancestor in reversed(ancestors):
         ancestor_user_emails, ancestor_group_names = _extract_read_access_restrictions(
             confluence_client=confluence_client,
             restrictions=ancestor.get("restrictions", {}),
@@ -241,20 +258,18 @@ def _get_all_page_restrictions(
             # the page's restrictions, so we ignore it
             continue
 
-        found_user_emails.intersection_update(ancestor_user_emails)
-        found_group_names.intersection_update(ancestor_group_names)
+        # if inheriting restrictions from the parent, then the first one we run into
+        # should be applied (the reason why we'd traverse more than one ancestor is if
+        # the ancestor also is in "inherit" mode.)
+        if ancestor_user_emails or ancestor_group_names:
+            return ExternalAccess(
+                external_user_emails=ancestor_user_emails,
+                external_user_group_ids=ancestor_group_names,
+                is_public=False,
+            )
 
-    # If there are no restrictions found, then the page
-    # inherits the space's restrictions so return None
-    if not found_user_emails and not found_group_names:
-        return None
-
-    return ExternalAccess(
-        external_user_emails=found_user_emails,
-        external_user_group_ids=found_group_names,
-        # there is no way for a page to be individually public if the space isn't public
-        is_public=False,
-    )
+    # we didn't find any restrictions, so the page inherits the space's restrictions
+    return None
 
 
 def _fetch_all_page_restrictions(
@@ -263,13 +278,11 @@ def _fetch_all_page_restrictions(
     space_permissions_by_space_key: dict[str, ExternalAccess],
     is_cloud: bool,
     callback: IndexingHeartbeatInterface | None,
-) -> list[DocExternalAccess]:
+) -> Generator[DocExternalAccess, None, None]:
     """
     For all pages, if a page has restrictions, then use those restrictions.
     Otherwise, use the space's restrictions.
     """
-    document_restrictions: list[DocExternalAccess] = []
-
     for slim_doc in slim_docs:
         if callback:
             if callback.should_stop():
@@ -286,11 +299,9 @@ def _fetch_all_page_restrictions(
             confluence_client=confluence_client,
             perm_sync_data=slim_doc.perm_sync_data,
         ):
-            document_restrictions.append(
-                DocExternalAccess(
-                    doc_id=slim_doc.id,
-                    external_access=restrictions,
-                )
+            yield DocExternalAccess(
+                doc_id=slim_doc.id,
+                external_access=restrictions,
             )
             # If there are restrictions, then we don't need to use the space's restrictions
             continue
@@ -324,11 +335,9 @@ def _fetch_all_page_restrictions(
             continue
 
         # If there are no restrictions, then use the space's restrictions
-        document_restrictions.append(
-            DocExternalAccess(
-                doc_id=slim_doc.id,
-                external_access=space_permissions,
-            )
+        yield DocExternalAccess(
+            doc_id=slim_doc.id,
+            external_access=space_permissions,
         )
         if (
             not space_permissions.is_public
@@ -342,13 +351,12 @@ def _fetch_all_page_restrictions(
             )
 
     logger.debug("Finished fetching all page restrictions for space")
-    return document_restrictions
 
 
 def confluence_doc_sync(
     cc_pair: ConnectorCredentialPair,
     callback: IndexingHeartbeatInterface | None,
-) -> list[DocExternalAccess]:
+) -> Generator[DocExternalAccess, None, None]:
     """
     Adds the external permissions to the documents in postgres
     if the document doesn't already exists in postgres, we create
@@ -387,7 +395,7 @@ def confluence_doc_sync(
         slim_docs.extend(doc_batch)
 
     logger.debug("Fetching all page restrictions for space")
-    return _fetch_all_page_restrictions(
+    yield from _fetch_all_page_restrictions(
         confluence_client=confluence_connector.confluence_client,
         slim_docs=slim_docs,
         space_permissions_by_space_key=space_permissions_by_space_key,

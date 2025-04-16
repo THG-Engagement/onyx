@@ -18,6 +18,7 @@ def web_connector(request: pytest.FixtureRequest) -> WebConnector:
         base_url="https://quotes.toscrape.com/scroll",
         web_connector_type=WEB_CONNECTOR_VALID_SETTINGS.SINGLE.value,
         scroll_before_scraping=scroll_before_scraping,
+        add_randomness=False,
     )
     return connector
 
@@ -32,6 +33,7 @@ def test_web_connector_scroll(web_connector: WebConnector) -> None:
 
     assert len(all_docs) == 1
     doc = all_docs[0]
+    assert doc.sections[0].text is not None
     assert EXPECTED_QUOTE in doc.sections[0].text
 
 
@@ -45,4 +47,5 @@ def test_web_connector_no_scroll(web_connector: WebConnector) -> None:
 
     assert len(all_docs) == 1
     doc = all_docs[0]
+    assert doc.sections[0].text is not None
     assert EXPECTED_QUOTE not in doc.sections[0].text

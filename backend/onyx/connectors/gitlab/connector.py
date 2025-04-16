@@ -21,7 +21,7 @@ from onyx.connectors.interfaces import SecondsSinceUnixEpoch
 from onyx.connectors.models import BasicExpertInfo
 from onyx.connectors.models import ConnectorMissingCredentialError
 from onyx.connectors.models import Document
-from onyx.connectors.models import Section
+from onyx.connectors.models import TextSection
 from onyx.utils.logger import setup_logger
 
 
@@ -56,7 +56,7 @@ def get_author(author: Any) -> BasicExpertInfo:
 def _convert_merge_request_to_document(mr: Any) -> Document:
     doc = Document(
         id=mr.web_url,
-        sections=[Section(link=mr.web_url, text=mr.description or "")],
+        sections=[TextSection(link=mr.web_url, text=mr.description or "")],
         source=DocumentSource.GITLAB,
         semantic_identifier=mr.title,
         # updated_at is UTC time but is timezone unaware, explicitly add UTC
@@ -72,7 +72,7 @@ def _convert_merge_request_to_document(mr: Any) -> Document:
 def _convert_issue_to_document(issue: Any) -> Document:
     doc = Document(
         id=issue.web_url,
-        sections=[Section(link=issue.web_url, text=issue.description or "")],
+        sections=[TextSection(link=issue.web_url, text=issue.description or "")],
         source=DocumentSource.GITLAB,
         semantic_identifier=issue.title,
         # updated_at is UTC time but is timezone unaware, explicitly add UTC
@@ -88,24 +88,31 @@ def _convert_issue_to_document(issue: Any) -> Document:
 def _convert_code_to_document(
     project: Project, file: Any, url: str, projectName: str, projectOwner: str
 ) -> Document:
+    # Dynamically get the default branch from the project object
+    default_branch = project.default_branch
+
+    # Fetch the file content using the correct branch
     file_content_obj = project.files.get(
-        file_path=file["path"], ref="master"
-    )  # Replace 'master' with your branch name if needed
+        file_path=file["path"], ref=default_branch  # Use the default branch
+    )
     try:
         file_content = file_content_obj.decode().decode("utf-8")
     except UnicodeDecodeError:
         file_content = file_content_obj.decode().decode("latin-1")
 
-    file_url = f"{url}/{projectOwner}/{projectName}/-/blob/master/{file['path']}"  # Construct the file URL
+    # Construct the file URL dynamically using the default branch
+    file_url = (
+        f"{url}/{projectOwner}/{projectName}/-/blob/{default_branch}/{file['path']}"
+    )
+
+    # Create and return a Document object
     doc = Document(
         id=file["id"],
-        sections=[Section(link=file_url, text=file_content)],
+        sections=[TextSection(link=file_url, text=file_content)],
         source=DocumentSource.GITLAB,
         semantic_identifier=file["name"],
-        doc_updated_at=datetime.now().replace(
-            tzinfo=timezone.utc
-        ),  # Use current time as updated_at
-        primary_owners=[],  # Fill this as needed
+        doc_updated_at=datetime.now().replace(tzinfo=timezone.utc),
+        primary_owners=[],  # Add owners if needed
         metadata={"type": "CodeFile"},
     )
     return doc

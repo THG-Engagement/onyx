@@ -1,4 +1,5 @@
 from datetime import datetime
+from datetime import timezone
 from typing import Any
 from typing import Generic
 from typing import TypeVar
@@ -122,11 +123,13 @@ class CredentialBase(BaseModel):
     name: str | None = None
     curator_public: bool = False
     groups: list[int] = Field(default_factory=list)
+    is_user_file: bool = False
 
 
 class CredentialSnapshot(CredentialBase):
     id: int
     user_id: UUID | None
+    user_email: str | None = None
     time_created: datetime
     time_updated: datetime
 
@@ -140,6 +143,7 @@ class CredentialSnapshot(CredentialBase):
                 else credential.credential_json
             ),
             user_id=credential.user_id,
+            user_email=credential.user.email if credential.user else None,
             admin_public=credential.admin_public,
             time_created=credential.time_created,
             time_updated=credential.time_updated,
@@ -206,6 +210,7 @@ class CCPairFullInfo(BaseModel):
     id: int
     name: str
     status: ConnectorCredentialPairStatus
+    in_repeated_error_state: bool
     num_docs_indexed: int
     connector: ConnectorSnapshot
     credential: CredentialSnapshot
@@ -218,6 +223,13 @@ class CCPairFullInfo(BaseModel):
     indexing: bool
     creator: UUID | None
     creator_email: str | None
+
+    # information on syncing/indexing
+    last_indexed: datetime | None
+    last_pruned: datetime | None
+    last_permission_sync: datetime | None
+    overall_indexing_speed: float | None
+    latest_checkpoint_description: str | None
 
     @classmethod
     def from_models(
@@ -236,7 +248,8 @@ class CCPairFullInfo(BaseModel):
         # there is a mismatch between these two numbers which may confuse users.
         last_indexing_status = last_index_attempt.status if last_index_attempt else None
         if (
-            last_indexing_status == IndexingStatus.SUCCESS
+            # only need to do this if the last indexing attempt is still in progress
+            last_indexing_status == IndexingStatus.IN_PROGRESS
             and number_of_index_attempts == 1
             and last_index_attempt
             and last_index_attempt.new_docs_indexed
@@ -245,10 +258,18 @@ class CCPairFullInfo(BaseModel):
                 last_index_attempt.new_docs_indexed if last_index_attempt else 0
             )
 
+        overall_indexing_speed = num_docs_indexed / (
+            (
+                datetime.now(tz=timezone.utc) - cc_pair_model.connector.time_created
+            ).total_seconds()
+            / 60
+        )
+
         return cls(
             id=cc_pair_model.id,
             name=cc_pair_model.name,
             status=cc_pair_model.status,
+            in_repeated_error_state=cc_pair_model.in_repeated_error_state,
             num_docs_indexed=num_docs_indexed,
             connector=ConnectorSnapshot.from_connector_db_model(
                 cc_pair_model.connector
@@ -264,9 +285,18 @@ class CCPairFullInfo(BaseModel):
             deletion_failure_message=cc_pair_model.deletion_failure_message,
             indexing=indexing,
             creator=cc_pair_model.creator_id,
-            creator_email=cc_pair_model.creator.email
-            if cc_pair_model.creator
-            else None,
+            creator_email=(
+                cc_pair_model.creator.email if cc_pair_model.creator else None
+            ),
+            last_indexed=(
+                last_index_attempt.time_started if last_index_attempt else None
+            ),
+            last_pruned=cc_pair_model.last_pruned,
+            last_permission_sync=(
+                last_index_attempt.time_started if last_index_attempt else None
+            ),
+            overall_indexing_speed=overall_indexing_speed,
+            latest_checkpoint_description=None,
         )
 
 
@@ -307,6 +337,9 @@ class ConnectorIndexingStatus(ConnectorStatus):
     """Represents the full indexing status of a connector"""
 
     cc_pair_status: ConnectorCredentialPairStatus
+    # this is separate from the `status` above, since a connector can be `INITIAL_INDEXING`, `ACTIVE`,
+    # or `PAUSED` and still be in a repeated error state.
+    in_repeated_error_state: bool
     owner: str
     last_finished_status: IndexingStatus | None
     last_status: IndexingStatus | None
@@ -392,7 +425,7 @@ class FileUploadResponse(BaseModel):
 
 
 class ObjectCreationIdResponse(BaseModel):
-    id: int | str
+    id: int
     credential: CredentialSnapshot | None = None
 
 

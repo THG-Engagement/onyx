@@ -13,9 +13,11 @@ import {
 
 export interface CustomConfigKey {
   name: string;
+  display_name: string;
   description: string | null;
   is_required: boolean;
   is_secret: boolean;
+  key_type: "text_input" | "file_input";
 }
 
 export interface WellKnownLLMProviderDescriptor {
@@ -36,6 +38,12 @@ export interface WellKnownLLMProviderDescriptor {
   groups: number[];
 }
 
+export interface LLMModelDescriptor {
+  modelName: string;
+  provider: string;
+  maxTokens: number;
+}
+
 export interface LLMProvider {
   name: string;
   provider: string;
@@ -49,13 +57,20 @@ export interface LLMProvider {
   groups: number[];
   display_model_names: string[] | null;
   deployment_name: string | null;
+  model_token_limits: { [key: string]: number } | null;
+  default_vision_model: string | null;
+  is_default_vision_provider: boolean | null;
 }
 
-export interface FullLLMProvider extends LLMProvider {
+export interface LLMProviderView extends LLMProvider {
   id: number;
   is_default_provider: boolean | null;
   model_names: string[];
   icon?: React.FC<{ size?: number; className?: string }>;
+}
+
+export interface VisionProvider extends LLMProviderView {
+  vision_models: string[];
 }
 
 export interface LLMProviderDescriptor {
@@ -68,6 +83,7 @@ export interface LLMProviderDescriptor {
   is_public: boolean;
   groups: number[];
   display_model_names: string[] | null;
+  model_token_limits: { [key: string]: number } | null;
 }
 
 export const getProviderIcon = (providerName: string, modelName?: string) => {

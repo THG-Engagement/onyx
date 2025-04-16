@@ -19,6 +19,7 @@ import httpx  # type: ignore
 import requests  # type: ignore
 from retry import retry
 
+from onyx.agents.agent_search.shared_graph_utils.models import QueryExpansionType
 from onyx.configs.chat_configs import DOC_TIME_DECAY
 from onyx.configs.chat_configs import NUM_RETURNED_HITS
 from onyx.configs.chat_configs import TITLE_CONTENT_RATIO
@@ -36,6 +37,7 @@ from onyx.document_index.interfaces import MinimalDocumentIndexingInfo
 from onyx.document_index.interfaces import UpdateRequest
 from onyx.document_index.interfaces import VespaChunkRequest
 from onyx.document_index.interfaces import VespaDocumentFields
+from onyx.document_index.interfaces import VespaDocumentUserFields
 from onyx.document_index.vespa.chunk_retrieval import batch_search_api_retrieval
 from onyx.document_index.vespa.chunk_retrieval import (
     parallel_visit_api_retrieval,
@@ -70,6 +72,8 @@ from onyx.document_index.vespa_constants import NUM_THREADS
 from onyx.document_index.vespa_constants import SEARCH_THREAD_NUMBER_PAT
 from onyx.document_index.vespa_constants import TENANT_ID_PAT
 from onyx.document_index.vespa_constants import TENANT_ID_REPLACEMENT
+from onyx.document_index.vespa_constants import USER_FILE
+from onyx.document_index.vespa_constants import USER_FOLDER
 from onyx.document_index.vespa_constants import VESPA_APPLICATION_ENDPOINT
 from onyx.document_index.vespa_constants import VESPA_DIM_REPLACEMENT_PAT
 from onyx.document_index.vespa_constants import VESPA_TIMEOUT
@@ -174,9 +178,9 @@ class VespaIndex(DocumentIndex):
         self.index_to_large_chunks_enabled: dict[str, bool] = {}
         self.index_to_large_chunks_enabled[index_name] = large_chunks_enabled
         if secondary_index_name and secondary_large_chunks_enabled:
-            self.index_to_large_chunks_enabled[
-                secondary_index_name
-            ] = secondary_large_chunks_enabled
+            self.index_to_large_chunks_enabled[secondary_index_name] = (
+                secondary_large_chunks_enabled
+            )
 
     def ensure_indices_exist(
         self,
@@ -187,7 +191,7 @@ class VespaIndex(DocumentIndex):
     ) -> None:
         if MULTI_TENANT:
             logger.info(
-                "Skipping Vespa index seup for multitenant (would wipe all indices)"
+                "Skipping Vespa index setup for multitenant (would wipe all indices)"
             )
             return None
 
@@ -386,9 +390,9 @@ class VespaIndex(DocumentIndex):
         new_document_id_to_original_document_id: dict[str, str] = {}
         for ind, chunk in enumerate(cleaned_chunks):
             old_chunk = chunks[ind]
-            new_document_id_to_original_document_id[
-                chunk.source_document.id
-            ] = old_chunk.source_document.id
+            new_document_id_to_original_document_id[chunk.source_document.id] = (
+                old_chunk.source_document.id
+            )
 
         existing_docs: set[str] = set()
 
@@ -592,7 +596,8 @@ class VespaIndex(DocumentIndex):
         self,
         doc_chunk_id: UUID,
         index_name: str,
-        fields: VespaDocumentFields,
+        fields: VespaDocumentFields | None,
+        user_fields: VespaDocumentUserFields | None,
         doc_id: str,
         http_client: httpx.Client,
     ) -> None:
@@ -603,21 +608,31 @@ class VespaIndex(DocumentIndex):
 
         update_dict: dict[str, dict] = {"fields": {}}
 
-        if fields.boost is not None:
-            update_dict["fields"][BOOST] = {"assign": fields.boost}
+        if fields is not None:
+            if fields.boost is not None:
+                update_dict["fields"][BOOST] = {"assign": fields.boost}
 
-        if fields.document_sets is not None:
-            update_dict["fields"][DOCUMENT_SETS] = {
-                "assign": {document_set: 1 for document_set in fields.document_sets}
-            }
+            if fields.document_sets is not None:
+                update_dict["fields"][DOCUMENT_SETS] = {
+                    "assign": {document_set: 1 for document_set in fields.document_sets}
+                }
 
-        if fields.access is not None:
-            update_dict["fields"][ACCESS_CONTROL_LIST] = {
-                "assign": {acl_entry: 1 for acl_entry in fields.access.to_acl()}
-            }
+            if fields.access is not None:
+                update_dict["fields"][ACCESS_CONTROL_LIST] = {
+                    "assign": {acl_entry: 1 for acl_entry in fields.access.to_acl()}
+                }
 
-        if fields.hidden is not None:
-            update_dict["fields"][HIDDEN] = {"assign": fields.hidden}
+            if fields.hidden is not None:
+                update_dict["fields"][HIDDEN] = {"assign": fields.hidden}
+
+        if user_fields is not None:
+            if user_fields.user_file_id is not None:
+                update_dict["fields"][USER_FILE] = {"assign": user_fields.user_file_id}
+
+            if user_fields.user_folder_id is not None:
+                update_dict["fields"][USER_FOLDER] = {
+                    "assign": user_fields.user_folder_id
+                }
 
         if not update_dict["fields"]:
             logger.error("Update request received but nothing to update.")
@@ -649,7 +664,8 @@ class VespaIndex(DocumentIndex):
         *,
         chunk_count: int | None,
         tenant_id: str,
-        fields: VespaDocumentFields,
+        fields: VespaDocumentFields | None,
+        user_fields: VespaDocumentUserFields | None,
     ) -> int:
         """Note: if the document id does not exist, the update will be a no-op and the
         function will complete with no errors or exceptions.
@@ -682,7 +698,12 @@ class VespaIndex(DocumentIndex):
 
                 for doc_chunk_id in doc_chunk_ids:
                     self._update_single_chunk(
-                        doc_chunk_id, index_name, fields, doc_id, httpx_client
+                        doc_chunk_id,
+                        index_name,
+                        fields,
+                        user_fields,
+                        doc_id,
+                        httpx_client,
                     )
 
         return doc_chunk_count
@@ -704,9 +725,10 @@ class VespaIndex(DocumentIndex):
         if self.secondary_index_name:
             index_names.append(self.secondary_index_name)
 
-        with self.httpx_client_context as http_client, concurrent.futures.ThreadPoolExecutor(
-            max_workers=NUM_THREADS
-        ) as executor:
+        with (
+            self.httpx_client_context as http_client,
+            concurrent.futures.ThreadPoolExecutor(max_workers=NUM_THREADS) as executor,
+        ):
             for (
                 index_name,
                 large_chunks_enabled,
@@ -723,6 +745,7 @@ class VespaIndex(DocumentIndex):
                     tenant_id=tenant_id,
                     large_chunks_enabled=large_chunks_enabled,
                 )
+
                 for doc_chunk_ids_batch in batch_generator(
                     chunks_to_delete, BATCH_SIZE
                 ):
@@ -778,12 +801,14 @@ class VespaIndex(DocumentIndex):
         hybrid_alpha: float,
         time_decay_multiplier: float,
         num_to_retrieve: int,
+        ranking_profile_type: QueryExpansionType,
         offset: int = 0,
         title_content_ratio: float | None = TITLE_CONTENT_RATIO,
     ) -> list[InferenceChunkUncleaned]:
         vespa_where_clauses = build_vespa_filters(filters)
         # Needs to be at least as much as the value set in Vespa schema config
         target_hits = max(10 * num_to_retrieve, 1000)
+
         yql = (
             YQL_BASE.format(index_name=self.index_name)
             + vespa_where_clauses
@@ -795,6 +820,11 @@ class VespaIndex(DocumentIndex):
 
         final_query = " ".join(final_keywords) if final_keywords else query
 
+        if ranking_profile_type == QueryExpansionType.KEYWORD:
+            ranking_profile = f"hybrid_search_keyword_base_{len(query_embedding)}"
+        else:
+            ranking_profile = f"hybrid_search_semantic_base_{len(query_embedding)}"
+
         logger.debug(f"Query YQL: {yql}")
 
         params: dict[str, str | int | float] = {
@@ -803,12 +833,14 @@ class VespaIndex(DocumentIndex):
             "input.query(query_embedding)": str(query_embedding),
             "input.query(decay_factor)": str(DOC_TIME_DECAY * time_decay_multiplier),
             "input.query(alpha)": hybrid_alpha,
-            "input.query(title_content_ratio)": title_content_ratio
-            if title_content_ratio is not None
-            else TITLE_CONTENT_RATIO,
+            "input.query(title_content_ratio)": (
+                title_content_ratio
+                if title_content_ratio is not None
+                else TITLE_CONTENT_RATIO
+            ),
             "hits": num_to_retrieve,
             "offset": offset,
-            "ranking.profile": f"hybrid_search{len(query_embedding)}",
+            "ranking.profile": ranking_profile,
             "timeout": VESPA_TIMEOUT,
         }
 

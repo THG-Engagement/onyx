@@ -96,7 +96,11 @@ def setup_onyx(
         )
 
         for cc_pair in get_connector_credential_pairs(db_session):
-            resync_cc_pair(cc_pair, db_session=db_session)
+            resync_cc_pair(
+                cc_pair=cc_pair,
+                search_settings_id=search_settings.id,
+                db_session=db_session,
+            )
 
     # Expire all old embedding models indexing attempts, technically redundant
     cancel_indexing_attempts_past_model(db_session)
@@ -145,9 +149,11 @@ def setup_onyx(
     success = setup_vespa(
         document_index,
         IndexingSetting.from_db_model(search_settings),
-        IndexingSetting.from_db_model(secondary_search_settings)
-        if secondary_search_settings
-        else None,
+        (
+            IndexingSetting.from_db_model(secondary_search_settings)
+            if secondary_search_settings
+            else None
+        ),
     )
     if not success:
         raise RuntimeError("Could not connect to Vespa within the specified timeout.")
@@ -307,6 +313,7 @@ def setup_postgres(db_session: Session) -> None:
             groups=[],
             display_model_names=OPEN_AI_MODEL_NAMES,
             model_names=OPEN_AI_MODEL_NAMES,
+            api_key_changed=True,
         )
         new_llm_provider = upsert_llm_provider(
             llm_provider=model_req, db_session=db_session
@@ -323,7 +330,7 @@ def update_default_multipass_indexing(db_session: Session) -> None:
         logger.info(
             "No existing docs or connectors found. Checking GPU availability for multipass indexing."
         )
-        gpu_available = gpu_status_request()
+        gpu_available = gpu_status_request(indexing=True)
         logger.info(f"GPU available: {gpu_available}")
 
         current_settings = get_current_search_settings(db_session)

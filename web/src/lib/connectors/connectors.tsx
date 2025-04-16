@@ -1,5 +1,4 @@
 import * as Yup from "yup";
-import { IsPublicGroupSelectorFormType } from "@/components/IsPublicGroupSelector";
 import { ConfigurableSources, ValidInputTypes, ValidSources } from "../types";
 import { AccessTypeGroupSelectorFormType } from "@/components/admin/connectors/AccessTypeGroupSelector";
 import { Credential } from "@/lib/connectors/credentials"; // Import Credential type
@@ -1249,9 +1248,51 @@ For example, specifying .*-support.* as a "channel" will cause the connector to 
     ],
     overrideDefaultFreq: 60 * 60 * 24,
   },
+  highspot: {
+    description: "Configure Highspot connector",
+    values: [
+      {
+        type: "tab",
+        name: "highspot_scope",
+        label: "What should we index from Highspot?",
+        optional: true,
+        tabs: [
+          {
+            value: "spots",
+            label: "Specific Spots",
+            fields: [
+              {
+                type: "list",
+                query: "Enter the spot name(s):",
+                label: "Spot Name(s)",
+                name: "spot_names",
+                optional: false,
+                description: "For multiple spots, enter your spot one by one.",
+              },
+            ],
+          },
+          {
+            value: "everything",
+            label: "Everything",
+            fields: [
+              {
+                type: "string_tab",
+                label: "Everything",
+                name: "everything",
+                description:
+                  "This connector will index all spots the provided credentials have access to!",
+              },
+            ],
+          },
+        ],
+      },
+    ],
+    advanced_values: [],
+  },
 };
 export function createConnectorInitialValues(
-  connector: ConfigurableSources
+  connector: ConfigurableSources,
+  currentCredential: Credential<any> | null = null
 ): Record<string, any> & AccessTypeGroupSelectorFormType {
   const configuration = connectorConfigs[connector];
 
@@ -1266,7 +1307,16 @@ export function createConnectorInitialValues(
         } else if (field.type === "list") {
           acc[field.name] = field.default || [];
         } else if (field.type === "checkbox") {
-          acc[field.name] = field.default || false;
+          // Special case for include_files_shared_with_me when using service account
+          if (
+            field.name === "include_files_shared_with_me" &&
+            currentCredential &&
+            !currentCredential.credential_json?.google_tokens
+          ) {
+            acc[field.name] = true;
+          } else {
+            acc[field.name] = field.default || false;
+          }
         } else if (field.default !== undefined) {
           acc[field.name] = field.default;
         }
@@ -1282,10 +1332,10 @@ export function createConnectorValidationSchema(
 ): Yup.ObjectSchema<Record<string, any>> {
   const configuration = connectorConfigs[connector];
 
-  return Yup.object().shape({
+  const object = Yup.object().shape({
     access_type: Yup.string().required("Access Type is required"),
     name: Yup.string().required("Connector Name is required"),
-    ...configuration.values.reduce(
+    ...[...configuration.values, ...configuration.advanced_values].reduce(
       (acc, field) => {
         let schema: any =
           field.type === "select"
@@ -1312,6 +1362,8 @@ export function createConnectorValidationSchema(
     pruneFreq: Yup.number().min(0, "Prune frequency must be non-negative"),
     refreshFreq: Yup.number().min(0, "Refresh frequency must be non-negative"),
   });
+
+  return object;
 }
 
 export const defaultPruneFreqDays = 30; // 30 days
